@@ -2,41 +2,56 @@
 `include "clockworks.v"
 
 module Memory (
-   input              clk,
-   input      [31:0]  mem_addr,  // address to be read
-   output reg [31:0]  mem_rdata, // data read from memory
-   input   	          mem_rstrb  // goes high when processor wants to read
+    input              clk,
+    input      [31:0]  mem_addr,  // address to be read
+    output reg [31:0]  mem_rdata, // data read from memory
+    input   	         mem_rstrb,  // goes high when processor wants to read
+    input      [31:0]  mem_wdata,
+    input      [3:0]   mem_wmask
 );
 
-   reg [31:0] MEM [0:255]; 
+  reg [31:0] MEM [0:255]; 
 
 `ifdef BENCH
-   localparam slow_bit=13;
+  localparam slow_bit=13;
 `else
-   localparam slow_bit=19;
+  localparam slow_bit=19;
 `endif
 
 `include "riscv_assembly.v"
-   integer L0_   = 8;
-   integer wait_ = 32;
+   integer L0_   = 12;
    integer L1_   = 40;
+   integer wait_ = 64;   
+   integer L2_   = 72;
    
-   initial begin
-      LI(s0,0);   
-      LI(s1,16);
+  initial begin
+      LI(a0,0);
+   // Copy 16 bytes from adress 400
+   // to address 800
+      LI(s1,16);      
+      LI(s0,0);         
    Label(L0_); 
-      LB(a0,s0,400); // LEDs are plugged on a0 (=x10)
+      LB(a1,s0,400);
+      SB(a1,s0,800);       
       CALL(LabelRef(wait_));
       ADDI(s0,s0,1); 
       BNE(s0,s1, LabelRef(L0_));
+
+   // Read 16 bytes from adress 800
+      LI(s0,0);
+   Label(L1_);
+      LB(a0,s0,800); // a0 (=x10) is plugged to the LEDs
+      CALL(LabelRef(wait_));
+      ADDI(s0,s0,1); 
+      BNE(s0,s1, LabelRef(L1_));
       EBREAK();
       
    Label(wait_);
       LI(t0,1);
       SLLI(t0,t0,slow_bit);
-   Label(L1_);
+   Label(L2_);
       ADDI(t0,t0,-1);
-      BNEZ(t0,LabelRef(L1_));
+      BNEZ(t0,LabelRef(L2_));
       RET();
 
       endASM();
@@ -48,13 +63,18 @@ module Memory (
       MEM[101] = {8'h8, 8'h7, 8'h6, 8'h5};
       MEM[102] = {8'hc, 8'hb, 8'ha, 8'h9};
       MEM[103] = {8'hff, 8'hf, 8'he, 8'hd};  
-   end
+  end
 
-   always @(posedge clk) begin
-      if(mem_rstrb) begin
-         mem_rdata <= MEM[mem_addr[31:2]];
-      end
-   end
+  wire [29:0] word_addr = mem_addr[31:2];
+  always @(posedge clk) begin
+    if(mem_rstrb) begin
+      mem_rdata <= MEM[mem_addr[31:2]];
+    end
+    if (mem_wmask[0]) MEM[word_addr][7:0  ] <= mem_wdata[7:0  ];
+    if (mem_wmask[1]) MEM[word_addr][15:8 ] <= mem_wdata[15:8 ];
+    if (mem_wmask[2]) MEM[word_addr][23:16] <= mem_wdata[23:16];
+    if (mem_wmask[3]) MEM[word_addr][31:24] <= mem_wdata[31:24];
+  end
 endmodule
 
 module Processor (
@@ -63,6 +83,8 @@ module Processor (
     output     [31:0] mem_addr, 
     input      [31:0] mem_rdata, 
     output 	          mem_rstrb,
+    output     [31:0] mem_wdata,
+    output     [3:0]  mem_wmask,
     output reg [31:0] x10 =0		  
 );
 
@@ -178,25 +200,45 @@ module Processor (
                                 instr[4] ? Uimm[31:0] :
                                 Bimm);
   wire [31:0] PCplus4 = PC + 4;
-
-  assign writeBackData = (isJAL || isJALR) ? (PCplus4) :
-                         (isLUI) ? Uimm :
-                         (isAUIPC) ? (PCplusImm) :
-                         aluOut;
-  assign writeBackEn = (state==EXECUTE && !isBranch); // save writeBackData to RegisterFile[rdId]
-                         
   wire [31:0] nextPC = (isBranch && takeBranch || isJAL) ? PCplusImm :
                         isJALR ? {aluPlus[31:1], 1'b0} :
                         PCplus4;
 
+  wire [31:0] loadstore_addr = rs1 + (isStore ? Simm : Iimm);
 
-  wire [31:0] loadstore_addr = rs1 + Iimm;
+  // what will be written back to register
+  assign writeBackData = (isJAL || isJALR) ? (PCplus4) :
+                         (isLUI) ? Uimm :
+                         (isAUIPC) ? (PCplusImm) :
+                         isLoad ? LOAD_data :
+                         aluOut;
+
+  // are we writing back to a register (or somewhere else)
+  assign writeBackEn = (state==EXECUTE && !isBranch && !isStore && !isLoad) || (state == WAIT_DATA); // save writeBackData to RegisterFile[rdId]
+
+
+  // LOAD from memory                       
+  wire mem_byteAccess = funct3[1:0] == 2'b00;
+  wire mem_halfwordAccess = funct3[1:0] == 2'b01;
+
   wire [15:0] LOAD_halfword = loadstore_addr[1] ? mem_rdata[31:16] : mem_rdata[15:0];
   wire [15:0] LOAD_byte = loadstore_addr[0] ? LOAD_halfword[15:8] : LOAD_halfword[7:0];
-  wire mem_byteAccess = funct3[1:0] == 2'b00;
-  wire mem_halfwordAcc = funct3[1:0] == 2'b01;
-  wire LOAD_sign = !funct3[2] & (mem_byteAccess ? LOAD_byte[7] : LOAD_halfword[15]); // sign is MSB, or 0 if unsigned load (funct3==0)
-  wire [31:0] LOAD_data = mem_byteAccess ? {{24{LOAD_sign}}, LOAD_byte} : mem_halfwordAcc ? {{16{LOAD_sign}}, LOAD_halfword} : mem_rdata;
+  wire        LOAD_sign = !funct3[2] & (mem_byteAccess ? LOAD_byte[7] : LOAD_halfword[15]); // sign is MSB, or 0 if unsigned load (funct3==0)
+  wire [31:0] LOAD_data = mem_byteAccess ? {{24{LOAD_sign}}, LOAD_byte} : mem_halfwordAccess ? {{16{LOAD_sign}}, LOAD_halfword} : mem_rdata;
+
+  // STORE to memory
+  assign mem_wdata[ 7: 0] = rs2[7:0];
+  assign mem_wdata[15: 8] = loadstore_addr[0] ? rs2[7:0] : rs2[15: 8];
+  assign mem_wdata[23:16] = loadstore_addr[1] ? rs2[7:0] : rs2[23:16];
+  assign mem_wdata[31:24] = loadstore_addr[0] ? rs2[7:0] : loadstore_addr[1] ? rs2[15:8] : rs2[31:24];
+  wire [3:0] STORE_wmask =
+	      mem_byteAccess      ?
+	            (loadstore_addr[1] ?
+		          (loadstore_addr[0] ? 4'b1000 : 4'b0100) :
+		          (loadstore_addr[0] ? 4'b0010 : 4'b0001)) :
+	      mem_halfwordAccess ?
+	            (loadstore_addr[1] ? 4'b1100 : 4'b0011) :
+              4'b1111;
 
   // states
   // The state machine
@@ -206,6 +248,7 @@ module Processor (
   localparam EXECUTE     = 3;
   localparam LOAD        = 4;
   localparam WAIT_DATA   = 5;
+  localparam STORE       = 6;
   reg [2:0] state = FETCH_INSTR;
 
   // cycle
@@ -239,7 +282,7 @@ module Processor (
           if (!isSYSTEM) begin
             PC <= nextPC;
           end
-          state <= isLoad ? LOAD : FETCH_INSTR;
+          state <= isLoad ? LOAD : isStore ? STORE : FETCH_INSTR;
           `ifdef BENCH
             if(isSYSTEM) $finish();
           `endif
@@ -250,12 +293,16 @@ module Processor (
         WAIT_DATA: begin
           state <= FETCH_INSTR;
         end
+        STORE: begin
+          state <= FETCH_INSTR;
+        end
       endcase 
     end
   end
 
   assign mem_addr = (state == WAIT_INSTR || state == FETCH_INSTR) ? PC : loadstore_addr;
   assign mem_rstrb = (state == FETCH_INSTR || state == LOAD);
+  assign mem_wmask = {4{(state == STORE)}} & STORE_wmask;
 
   `ifdef BENCH2
     always @(posedge clk) begin
@@ -298,12 +345,16 @@ module SOC (
     .clk(clk),
     .mem_addr(mem_addr),   //input
     .mem_rstrb(mem_rstrb), //input
-    .mem_rdata(mem_rdata)  //output
+    .mem_rdata(mem_rdata),  //output
+    .mem_wdata(mem_wdata),
+    .mem_wmask(mem_wmask)
   );
 
   wire [31:0] mem_addr;
   wire [31:0] mem_rdata;
   wire mem_rstrb;
+  wire [31:0] mem_wdata;
+  wire [3:0]  mem_wmask;
   wire [31:0] x10;
 
   Processor CPU(
@@ -312,20 +363,22 @@ module SOC (
     .mem_rdata(mem_rdata), //input
     .mem_addr(mem_addr),   //output
     .mem_rstrb(mem_rstrb), //output
+    .mem_wdata(mem_wdata),
+    .mem_wmask(mem_wmask),
     .x10(x10)
   );
 
-  assign LEDS = x10[4:0];
 
    // Gearbox and reset circuitry.
-   Clockworks
+  Clockworks
     // #(.SLOW(21)) // Divide clock frequency by 2^21
-   CW(
-     .CLK(CLK),
-     .RESET(RESET),
-     .clk(clk),
-     .resetn(resetn)
-   );
+  CW(
+    .CLK(CLK),
+    .RESET(RESET),
+    .clk(clk),
+    .resetn(resetn)
+  );
    
-   assign TXD  = 1'b0; // not used for now
+  assign LEDS = x10[4:0];
+  assign TXD  = 1'b0; // not used for now
 endmodule
