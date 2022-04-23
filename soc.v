@@ -1,5 +1,6 @@
 `default_nettype none
 `include "clockworks.v"
+`include "emitter_uart.v"
 
 module Memory (
     input              clk,
@@ -10,60 +11,94 @@ module Memory (
     input      [3:0]   mem_wmask
 );
 
-  reg [31:0] MEM [0:255]; 
+  reg [31:0] MEM [0:1535]; 
 
 `ifdef BENCH
-  localparam slow_bit=13;
+  localparam slow_bit=12;
 `else
-  localparam slow_bit=19;
+  localparam slow_bit=17;
 `endif
 
-`include "riscv_assembly.v"
-   integer L0_   = 12;
-   integer L1_   = 40;
-   integer wait_ = 64;   
-   integer L2_   = 72;
-   
-  initial begin
-      LI(a0,0);
-   // Copy 16 bytes from adress 400
-   // to address 800
-      LI(s1,16);      
-      LI(s0,0);         
-   Label(L0_); 
-      LB(a1,s0,400);
-      SB(a1,s0,800);       
-      CALL(LabelRef(wait_));
-      ADDI(s0,s0,1); 
-      BNE(s0,s1, LabelRef(L0_));
+  // Memory-mapped IO in IO page, 1-hot addressing in word address.   
+  localparam IO_LEDS_bit      = 0;  // W five leds - offset = 32'h400004
+  localparam IO_UART_DAT_bit  = 1;  // W data to send (8 bits), offset = 32'h400008
+  localparam IO_UART_CNTL_bit = 2;  // R status. bit 9: busy sending, offset = 32'h400010
 
-   // Read 16 bytes from adress 800
-      LI(s0,0);
+  // Converts an IO_xxx_bit constant into an offset in IO page.
+  function [31:0] IO_BIT_TO_OFFSET;
+    input [31:0] bitid;
+    begin
+      IO_BIT_TO_OFFSET = 1 << (bitid + 2);
+    end
+  endfunction
+
+`include "riscv_assembly.v"
+   integer    L0_      = 12;
+   integer    L1_      = 20;
+   integer    L2_      = 52;      
+   integer    wait_    = 104;
+   integer    wait_L0_ = 112;
+   integer    putc_    = 124; 
+   integer    putc_L0_ = 132;
+   
+   initial begin
+      LI(sp,32'h1800);   // End of RAM, 6kB
+      LI(gp,32'h400000); // IO page
+
+   Label(L0_);
+
+      // Count from 0 to 15 on the LEDs      
+      LI(s0,16); // upper bound of loop
+      LI(a0,0);
    Label(L1_);
-      LB(a0,s0,800); // a0 (=x10) is plugged to the LEDs
+      SW(a0,gp,IO_BIT_TO_OFFSET(IO_LEDS_bit));
       CALL(LabelRef(wait_));
-      ADDI(s0,s0,1); 
-      BNE(s0,s1, LabelRef(L1_));
-      EBREAK();
+      ADDI(a0,a0,1);
+      BNE(a0,s0,LabelRef(L1_));
+
+      // Send abcdef...xyz to the UART
+      LI(s0,26); // upper bound of loop     
+      LI(a0,"a");
+      LI(s1,0);
+   Label(L2_);
+      CALL(LabelRef(putc_));
+      ADDI(a0,a0,1);
+      ADDI(s1,s1,1);
+      BNE(s1,s0,LabelRef(L2_));
+
+      // CR;LF
+      LI(a0,13);
+      CALL(LabelRef(putc_));
+      LI(a0,10);
+      CALL(LabelRef(putc_));
       
+      J(LabelRef(L0_));
+      
+      EBREAK(); // I systematically keep it before functions
+                // in case I decide to remove the loop...
+
    Label(wait_);
       LI(t0,1);
       SLLI(t0,t0,slow_bit);
-   Label(L2_);
+   Label(wait_L0_);
       ADDI(t0,t0,-1);
-      BNEZ(t0,LabelRef(L2_));
+      BNEZ(t0,LabelRef(wait_L0_));
       RET();
 
+   Label(putc_);
+      // Send character to UART
+      SW(a0,gp,IO_BIT_TO_OFFSET(IO_UART_DAT_bit));
+      // Read UART status, and loop until bit 9 (busy sending)
+      // is zero.
+      LI(t0,1<<9);
+   Label(putc_L0_);
+      LW(t1,gp,IO_BIT_TO_OFFSET(IO_UART_CNTL_bit));     
+      AND(t1,t1,t0);
+      BNEZ(t1,LabelRef(putc_L0_));
+      RET();
+	   
       endASM();
-
-      // Note: index 100 (word address)
-      //     corresponds to 
-      // address 400 (byte address)
-      MEM[100] = {8'h4, 8'h3, 8'h2, 8'h1};
-      MEM[101] = {8'h8, 8'h7, 8'h6, 8'h5};
-      MEM[102] = {8'hc, 8'hb, 8'ha, 8'h9};
-      MEM[103] = {8'hff, 8'hf, 8'he, 8'hd};  
-  end
+   end
 
   wire [29:0] word_addr = mem_addr[31:2];
   always @(posedge clk) begin
@@ -84,8 +119,7 @@ module Processor (
     input      [31:0] mem_rdata, 
     output 	          mem_rstrb,
     output     [31:0] mem_wdata,
-    output     [3:0]  mem_wmask,
-    output reg [31:0] x10 =0		  
+    output     [3:0]  mem_wmask
 );
 
   reg [31:0] PC=0;
@@ -136,7 +170,7 @@ module Processor (
     integer     i;
     initial begin
       for(i=0; i<32; ++i) begin
-    RegisterBank[i] = 0;
+        RegisterBank[i] = 0;
       end
     end
   `endif   
@@ -200,18 +234,18 @@ module Processor (
                                 instr[4] ? Uimm[31:0] :
                                 Bimm);
   wire [31:0] PCplus4 = PC + 4;
-  wire [31:0] nextPC = (isBranch && takeBranch || isJAL) ? PCplusImm :
+  wire [31:0] nextPC = ((isBranch && takeBranch) || isJAL) ? PCplusImm :
                         isJALR ? {aluPlus[31:1], 1'b0} :
                         PCplus4;
 
   wire [31:0] loadstore_addr = rs1 + (isStore ? Simm : Iimm);
 
   // what will be written back to register
-  assign writeBackData = (isJAL || isJALR) ? (PCplus4) :
-                         (isLUI) ? Uimm :
-                         (isAUIPC) ? (PCplusImm) :
-                         isLoad ? LOAD_data :
-                         aluOut;
+  assign writeBackData = (isJAL || isJALR)  ? PCplus4 :
+                         isLUI              ? Uimm :
+                         isAUIPC            ? PCplusImm :
+                         isLoad             ? LOAD_data :
+                                              aluOut;
 
   // are we writing back to a register (or somewhere else)
   assign writeBackEn = (state==EXECUTE && !isBranch && !isStore && !isLoad) || (state == WAIT_DATA); // save writeBackData to RegisterFile[rdId]
@@ -259,7 +293,6 @@ module Processor (
     end else begin
       if (writeBackEn && rdId != 0) begin
         RegisterBank[rdId] <= writeBackData;
-        if(rdId == 10) x10 <= writeBackData;
         `ifdef BENCH	 
 	        // $display("x%0d <= %b", rdId, writeBackData);
         `endif
@@ -300,6 +333,7 @@ module Processor (
     end
   end
 
+  // outputs
   assign mem_addr = (state == WAIT_INSTR || state == FETCH_INSTR) ? PC : loadstore_addr;
   assign mem_rstrb = (state == FETCH_INSTR || state == LOAD);
   assign mem_wmask = {4{(state == STORE)}} & STORE_wmask;
@@ -324,16 +358,12 @@ module Processor (
     end
   `endif
 
-  // outputs
-  assign mem_addr = PC;
-  assign mem_rstrb = (state == FETCH_INSTR);
-
 endmodule
 
 module SOC (
   input CLK,
   input RESET,
-  output [4:0] LEDS,
+  output reg [4:0] LEDS,
   input RXD,
   output TXD
 );
@@ -341,21 +371,22 @@ module SOC (
   wire clk;
   wire resetn;
 
-  Memory RAM(
-    .clk(clk),
-    .mem_addr(mem_addr),   //input
-    .mem_rstrb(mem_rstrb), //input
-    .mem_rdata(mem_rdata),  //output
-    .mem_wdata(mem_wdata),
-    .mem_wmask(mem_wmask)
-  );
-
   wire [31:0] mem_addr;
   wire [31:0] mem_rdata;
   wire mem_rstrb;
   wire [31:0] mem_wdata;
   wire [3:0]  mem_wmask;
-  wire [31:0] x10;
+
+//  Memory            |                   | Processor     
+//                    |                   |                
+//                    |  <<<<<<<<<<<<<<   | mem_addr                
+//                    |  <<<<<<<<<<<<<<   | mem_rstrb                
+//                    |  <<<<<<<<<<<<<<   | mem_wdata                
+//                    |  <<<<<<<<<<<<<<   | mem_wmask   
+//                    |                   |           
+//          mem_rdata |  >> RAM_rdata >>  |                 
+//                    |  >> IO_rdata  >>  |                 
+
 
   Processor CPU(
     .clk(clk),
@@ -363,11 +394,76 @@ module SOC (
     .mem_rdata(mem_rdata), //input
     .mem_addr(mem_addr),   //output
     .mem_rstrb(mem_rstrb), //output
-    .mem_wdata(mem_wdata),
-    .mem_wmask(mem_wmask),
-    .x10(x10)
+    .mem_wdata(mem_wdata), //output
+    .mem_wmask(mem_wmask)  //output
   );
 
+  wire [31:0] RAM_rdata;
+  wire [29:0] mem_wordaddr = mem_addr[31:2];
+  wire isIO  = mem_addr[22]; // 00000000000000000000000000000000
+  wire isRAM = !isIO;
+  wire mem_wstrb = |mem_wmask;
+
+  Memory RAM(
+    .clk(clk),
+    .mem_addr(mem_addr),              //input
+    .mem_rstrb(isRAM & mem_rstrb),    //input
+    .mem_wdata(mem_wdata),            //input
+    .mem_wmask({4{isRAM}}&mem_wmask), //input - if isIO will be 0000 to stop write to physical ram as addr is virtual only
+    .mem_rdata(RAM_rdata)             //output
+  );
+
+  // virtual addresses
+  // 00000000010000000000000000000000 = 0x400000  
+  // 00000000010000000000000000000100 = 0x400004 = IO_LEDS_bit = 0
+  // 00000000010000000000000000001000 = 0x400008 = IO_UART_DAT_BIT = 1
+  // 00000000010000000000000000010000 = 0x400010 = IO_UART_CNTL_BIT = 2
+
+  // mem_wordaddr = mem_addr[31:2];
+  // 000000000100000000000000000001 = mem_wordaddr[IO_LEDS_bit] = 1
+  // 000000000100000000000000000010 = mem_wordaddr[IO_UART_DAT_BIT] = 1
+  // 000000000100000000000000000100 = mem_wordaddr[IO_UART_CNTL_BIT] = 1
+
+  // Memory-mapped IO in IO page, 1-hot addressing in word address.   
+  localparam IO_LEDS_bit      = 0;  // W five leds
+  localparam IO_UART_DAT_bit  = 1;  // W data to send (8 bits) 
+  localparam IO_UART_CNTL_bit = 2;  // R status. bit 9: busy sending
+   
+  always @(posedge clk) begin
+    if(isIO & mem_wstrb & mem_wordaddr[IO_LEDS_bit]) begin
+      LEDS <= mem_wdata;
+    end
+  end
+
+  wire uart_valid = isIO & mem_wstrb & mem_wordaddr[IO_UART_DAT_bit];
+  wire uart_ready;
+
+  corescore_emitter_uart #(
+    .clk_freq_hz(`CPU_FREQ*1000000),
+    .baud_rate(1000000)			    
+  ) UART(
+    .i_clk(clk),
+    .i_rst(!resetn),
+    .i_data(mem_wdata[7:0]),
+    .i_valid(uart_valid),
+    .o_ready(uart_ready),
+    .o_uart_tx(TXD)      			       
+  );
+
+     wire [31:0] IO_rdata = 
+	       mem_wordaddr[IO_UART_CNTL_bit] ? { 22'b0, !uart_ready, 9'b0}
+	                                      : 32'b0;
+   
+   assign mem_rdata = isRAM ? RAM_rdata : IO_rdata;
+
+`ifdef BENCH
+   always @(posedge clk) begin
+      if(uart_valid) begin
+	 $write("%c", mem_wdata[7:0] );
+	 $fflush(32'h8000_0001);
+      end
+   end
+`endif   
 
    // Gearbox and reset circuitry.
   Clockworks
@@ -379,6 +475,5 @@ module SOC (
     .resetn(resetn)
   );
    
-  assign LEDS = x10[4:0];
-  assign TXD  = 1'b0; // not used for now
+
 endmodule
