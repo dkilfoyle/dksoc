@@ -13,94 +13,25 @@ module Memory (
 
   reg [31:0] MEM [0:1535]; 
 
-`ifdef BENCH
-  localparam slow_bit=12;
-`else
-  localparam slow_bit=17;
-`endif
+  initial begin
+    $readmemh("firmware.hex",MEM);
+  end
 
   // Memory-mapped IO in IO page, 1-hot addressing in word address.   
-  localparam IO_LEDS_bit      = 0;  // W five leds - offset = 32'h400004
-  localparam IO_UART_DAT_bit  = 1;  // W data to send (8 bits), offset = 32'h400008
-  localparam IO_UART_CNTL_bit = 2;  // R status. bit 9: busy sending, offset = 32'h400010
+  // localparam IO_LEDS_bit      = 0;  // W five leds - offset = 32'h400004
+  // localparam IO_UART_DAT_bit  = 1;  // W data to send (8 bits), offset = 32'h400008
+  // localparam IO_UART_CNTL_bit = 2;  // R status. bit 9: busy sending, offset = 32'h400010
 
-  // Converts an IO_xxx_bit constant into an offset in IO page.
-  function [31:0] IO_BIT_TO_OFFSET;
-    input [31:0] bitid;
-    begin
-      IO_BIT_TO_OFFSET = 1 << (bitid + 2);
-    end
-  endfunction
-
-`include "riscv_assembly.v"
-   integer    L0_      = 12;
-   integer    L1_      = 20;
-   integer    L2_      = 52;      
-   integer    wait_    = 104;
-   integer    wait_L0_ = 112;
-   integer    putc_    = 124; 
-   integer    putc_L0_ = 132;
-   
-   initial begin
-      LI(sp,32'h1800);   // End of RAM, 6kB
-      LI(gp,32'h400000); // IO page
-
-   Label(L0_);
-
-      // Count from 0 to 15 on the LEDs      
-      LI(s0,16); // upper bound of loop
-      LI(a0,0);
-   Label(L1_);
-      SW(a0,gp,IO_BIT_TO_OFFSET(IO_LEDS_bit));
-      CALL(LabelRef(wait_));
-      ADDI(a0,a0,1);
-      BNE(a0,s0,LabelRef(L1_));
-
-      // Send abcdef...xyz to the UART
-      LI(s0,26); // upper bound of loop     
-      LI(a0,"a");
-      LI(s1,0);
-   Label(L2_);
-      CALL(LabelRef(putc_));
-      ADDI(a0,a0,1);
-      ADDI(s1,s1,1);
-      BNE(s1,s0,LabelRef(L2_));
-
-      // CR;LF
-      LI(a0,13);
-      CALL(LabelRef(putc_));
-      LI(a0,10);
-      CALL(LabelRef(putc_));
-      
-      J(LabelRef(L0_));
-      
-      EBREAK(); // I systematically keep it before functions
-                // in case I decide to remove the loop...
-
-   Label(wait_);
-      LI(t0,1);
-      SLLI(t0,t0,slow_bit);
-   Label(wait_L0_);
-      ADDI(t0,t0,-1);
-      BNEZ(t0,LabelRef(wait_L0_));
-      RET();
-
-   Label(putc_);
-      // Send character to UART
-      SW(a0,gp,IO_BIT_TO_OFFSET(IO_UART_DAT_bit));
-      // Read UART status, and loop until bit 9 (busy sending)
-      // is zero.
-      LI(t0,1<<9);
-   Label(putc_L0_);
-      LW(t1,gp,IO_BIT_TO_OFFSET(IO_UART_CNTL_bit));     
-      AND(t1,t1,t0);
-      BNEZ(t1,LabelRef(putc_L0_));
-      RET();
-	   
-      endASM();
-   end
+  // // Converts an IO_xxx_bit constant into an offset in IO page.
+  // function [31:0] IO_BIT_TO_OFFSET;
+  //   input [31:0] bitid;
+  //   begin
+  //     IO_BIT_TO_OFFSET = 1 << (bitid + 2);
+  //   end
+  // endfunction
 
   wire [29:0] word_addr = mem_addr[31:2];
+
   always @(posedge clk) begin
     if(mem_rstrb) begin
       mem_rdata <= MEM[mem_addr[31:2]];
@@ -377,16 +308,14 @@ module SOC (
   wire [31:0] mem_wdata;
   wire [3:0]  mem_wmask;
 
-//  Memory            |                   | Processor     
-//                    |                   |                
-//                    |  <<<<<<<<<<<<<<   | mem_addr                
-//                    |  <<<<<<<<<<<<<<   | mem_rstrb                
-//                    |  <<<<<<<<<<<<<<   | mem_wdata                
-//                    |  <<<<<<<<<<<<<<   | mem_wmask   
-//                    |                   |           
-//          mem_rdata |  >> RAM_rdata >>  |                 
-//                    |  >> IO_rdata  >>  |                 
-
+//  Memory            |        SOC              | Processor                     | Devices
+// ================== | ======================= | ============================= | =====================
+//                    |  <<<<<<<<<<<<<<         | << mem_addr                   | 0x400004 = LEDS
+//                    |  <<<<<<<<<<<<<<         | << mem_rstrb                  | 0x400008 = UART_DAT
+//                    |  <<<<<<<<<<<<<<         | << mem_wdata                  | 0x400004 = UART_CNTL
+//                    |  <<<<<<<<<<<<<<         | << mem_wmask                  |
+//                    |                         |                               |
+//        mem_rdata >>|  >>>> RAM_rdata >>>>    | >> mem_rdata                  | <<<< IO_rdata
 
   Processor CPU(
     .clk(clk),
@@ -420,9 +349,9 @@ module SOC (
   // 00000000010000000000000000010000 = 0x400010 = IO_UART_CNTL_BIT = 2
 
   // mem_wordaddr = mem_addr[31:2];
-  // 000000000100000000000000000001 = mem_wordaddr[IO_LEDS_bit] = 1
-  // 000000000100000000000000000010 = mem_wordaddr[IO_UART_DAT_BIT] = 1
-  // 000000000100000000000000000100 = mem_wordaddr[IO_UART_CNTL_BIT] = 1
+  // 000000000100000000000000000001__ = mem_wordaddr[IO_LEDS_bit] = 1
+  // 000000000100000000000000000010__ = mem_wordaddr[IO_UART_DAT_BIT] = 1
+  // 000000000100000000000000000100__ = mem_wordaddr[IO_UART_CNTL_BIT] = 1
 
   // Memory-mapped IO in IO page, 1-hot addressing in word address.   
   localparam IO_LEDS_bit      = 0;  // W five leds
@@ -459,8 +388,8 @@ module SOC (
 `ifdef BENCH
    always @(posedge clk) begin
       if(uart_valid) begin
-	 $write("%c", mem_wdata[7:0] );
-	 $fflush(32'h8000_0001);
+        $write("%c", mem_wdata[7:0] );
+        $fflush(32'h8000_0001);
       end
    end
 `endif   
